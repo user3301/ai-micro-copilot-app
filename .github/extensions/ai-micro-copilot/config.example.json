@@ -1,0 +1,23 @@
+{
+  "slots": [null, null, null, null, null, null],
+  "transport": "usb",
+  "serialNumber": null,
+  "brightness": 0.25,
+  "pollMs": 2000,
+  "keys": {
+    "ACT06": "previous",
+    "ACT07": "next",
+    "ACT08": "attention",
+    "ACT09": "new-session",
+    "ACT10": "status",
+    "ACT11": "focus",
+    "ACT12": "brightness",
+    "ENC": "focus",
+    "ENC_CW": "next",
+    "ENC_CC": "previous",
+    "JOY_UP": "attention",
+    "JOY_DOWN": "status",
+    "JOY_LEFT": "previous",
+    "JOY_RIGHT": "next"
+  }
+}
