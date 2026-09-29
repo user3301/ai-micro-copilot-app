@@ -4,6 +4,7 @@
   "serialNumber": null,
   "brightness": 0.25,
   "pollMs": 2000,
+  "backgroundIdleMs": 300000,
   "keys": {
     "ACT06": "previous",
     "ACT07": "next",

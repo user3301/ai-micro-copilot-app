@@ -8,6 +8,7 @@ export const DEFAULT_CONFIG = {
     serialNumber: null,
     brightness: 0.25,
     pollMs: 2000,
+    backgroundIdleMs: 300000,
     keys: {
         ACT06: "previous", ACT07: "next", ACT08: "attention",
         ACT09: "new-session", ACT10: "status", ACT11: "focus",
@@ -39,6 +40,9 @@ export function validateConfig(value) {
         throw new Error("brightness must be between 0 and 1");
     if (!Number.isInteger(config.pollMs) || config.pollMs < 1000 || config.pollMs > 30000)
         throw new Error("pollMs must be between 1000 and 30000");
+    if (!Number.isInteger(config.backgroundIdleMs) || config.backgroundIdleMs < 0 ||
+        config.backgroundIdleMs > 86400000)
+        throw new Error("backgroundIdleMs must be an integer between 0 and 86400000; 0 disables idle lighting");
     if (value.keys !== undefined && (!value.keys || typeof value.keys !== "object" ||
         Array.isArray(value.keys))) throw new Error("keys must be an object");
     for (const [key, action] of Object.entries(config.keys)) {
@@ -154,12 +158,12 @@ export function eventAction(message, config) {
             return { action: "slot", slot };
         }
         const action = config.keys[p.k];
-        return action && action !== "none" ? { action } : null;
+        return action ? { action } : null;
     }
     if (message.method === "v.oai.rad" && p.d === 1) {
         const key = { 0: "JOY_RIGHT", 0.25: "JOY_DOWN", 0.5: "JOY_LEFT", 0.75: "JOY_UP" }[p.a];
         const action = config.keys[key];
-        return action && action !== "none" ? { action } : null;
+        return action ? { action } : null;
     }
     return null;
 }

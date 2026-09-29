@@ -48,6 +48,8 @@ const properties = {
             transport: { type: "string", enum: ["usb", "bluetooth"] },
             brightness: { type: "number", minimum: 0, maximum: 1 },
             pollMs: { type: "integer", minimum: 1000, maximum: 30000 },
+            backgroundIdleMs: { type: "integer", minimum: 0, maximum: 86400000,
+                description: "Hardware inactivity before background and function-key lights turn off; default 300000 ms (5 minutes). Agent LEDs stay on. 0 disables." },
             keys: { type: "object", additionalProperties: { type: "string", enum: ACTIONS } },
         },
     },

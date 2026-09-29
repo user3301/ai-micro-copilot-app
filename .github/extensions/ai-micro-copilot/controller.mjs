@@ -2,7 +2,7 @@
 import { eventAction, lightsFor, nextSlot, sessionState, validateConfig } from "./core.mjs";
 
 export class Controller {
-    constructor({ config, readSessions, call, navigate, open, save, log }) {
+    constructor({ config, readSessions, call, navigate, open, save, log, now = () => performance.now() }) {
         this.config = validateConfig(config);
         this.readSessions = readSessions; this.call = call;
         this.navigate = navigate;
@@ -10,6 +10,8 @@ export class Controller {
         this.sessions = []; this.selected = null; this.running = false;
         this.stale = true; this.device = null; this.fault = null;
         this.identity = null;
+        this.now = now; this.lastInputAt = now();
+        this.backgroundIdle = false; this.backgroundBrightness = null;
         this.queue = Promise.resolve(); this.queued = 0; this.lastError = "";
     }
     enqueue(operation, force = false) {
@@ -41,6 +43,7 @@ export class Controller {
         });
         this.identity = this.device.info?.serialNumber ?? this.identity;
         this.fault = null;
+        this.backgroundBrightness = null;
         const device = this.device;
         device.on("fault", error => {
             if (this.device === device) { this.fault = error; this.report(error); }
@@ -49,19 +52,27 @@ export class Controller {
             if (!this.running || this.device !== device || this.fault) return;
             try {
                 const action = eventAction(message, this.config);
-                if (action) this.enqueue(() => {
-                    if (this.device !== device) throw new Error("Connection changed; queued action was not executed");
-                    return this.perform(action);
-                }).catch(error => this.report(error));
+                if (action) {
+                    this.lastInputAt = this.now();
+                    this.enqueue(() => {
+                        if (this.device !== device) throw new Error("Connection changed; queued action was not executed");
+                        return this.perform(action);
+                    }).catch(error => this.report(error));
+                }
             } catch (error) { this.report(error); }
         });
         await this.paintBackground();
     }
     async paintBackground() {
+        const idle = this.config.backgroundIdleMs > 0 &&
+            this.now() - this.lastInputAt >= this.config.backgroundIdleMs;
+        const brightness = idle ? 0 : this.config.brightness * 0.4;
+        if (idle === this.backgroundIdle && brightness === this.backgroundBrightness) return;
         await this.device.request("v.oai.rgbcfg", {
-            ambient: { c: 0x8050ff, b: this.config.brightness * 0.4, e: "solid" },
-            keys: { c: 0xffffff, b: this.config.brightness * 0.4, e: "solid" },
+            ambient: { c: idle ? 0 : 0x8050ff, b: brightness, e: idle ? "off" : "solid" },
+            keys: { c: idle ? 0 : 0xffffff, b: brightness, e: idle ? "off" : "solid" },
         });
+        this.backgroundIdle = idle; this.backgroundBrightness = brightness;
     }
     async paint() {
         await this.device.request("v.oai.thstatus",
@@ -71,6 +82,7 @@ export class Controller {
         return this.enqueue(async () => {
             if (this.running) return this.status();
             if (this.config.slots.every(id => id === null)) throw new Error("Bind at least one session first");
+            this.lastInputAt = this.now();
             await this.refresh();
             try {
                 await this.connect();
@@ -104,6 +116,7 @@ export class Controller {
                 await device.close();
             }
             if (!this.device) await this.connect();
+            await this.paintBackground();
             await this.paint();
             if (!this.stale && this.lastError) {
                 this.lastError = "";
@@ -188,6 +201,9 @@ export class Controller {
         if (!this.running) return;
         if (!this.device || this.fault) throw new Error("Device disconnected; queued action was not executed");
         const device = this.device;
+        try { await this.paintBackground(); }
+        catch (error) { this.fault = error; throw error; }
+        if (action === "none") return;
         await this.refresh();
         if (!this.running) return;
         if (this.device !== device || this.fault)
@@ -232,6 +248,8 @@ export class Controller {
             serialNumber: this.device?.info?.serialNumber ?? this.config.serialNumber ?? this.identity,
             firmwareVersion: this.device?.info?.version ?? null,
             stale: this.stale, selectedSlot: this.selected === null ? null : this.selected + 1,
+            backgroundIdle: this.running && this.backgroundIdle,
+            backgroundIdleMs: this.config.backgroundIdleMs,
             error: this.lastError || null,
             slots: this.config.slots.map((id, slot) => {
                 const session = this.sessions.find(s => s.id === id);

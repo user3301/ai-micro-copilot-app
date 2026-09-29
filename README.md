@@ -15,6 +15,7 @@ This is an unofficial, community-maintained host extension, not firmware or an o
 - Switch sessions directly using Agent keys, the rotary encoder and the joystick.
 - Change bindings through an agent conversation: save configuration and apply it immediately, without restarting the bridge.
 - Connect over USB or Windows Bluetooth HID, and retry the same device after disconnection.
+- Turn off background and function-key lighting after five minutes without hardware input, while keeping Agent status LEDs active; the next operation wakes the background and still performs its action.
 - Keep configuration local. No additional GitHub token, App database access, global key injection, automatic approvals or prompt sending.
 
 The keys represent **project sessions**, not temporary subagents within a session. Green means the App reports an idle session, not that its task succeeded.
@@ -72,6 +73,8 @@ The extension creates `.github\extensions\ai-micro-copilot\config.json` when you
 Use the `ai_micro_control` tool through the agent to change bindings. Its `bind` operation saves the file atomically and updates the running bridge. **There is no file watcher**: manual JSON edits require stopping, reloading and starting the extension.
 
 After restarting the computer or App, open the hosting session, let the extension load, and ask the agent to **start the bridge again**. Bindings persist, but the running state does not. An already-running bridge retries when the keyboard comes back online. Keep the hosting session running.
+
+`backgroundIdleMs` controls background-light inactivity: it defaults to `300000` (five minutes), accepts integer milliseconds up to `86400000`, and can be set to `0` to disable automatic background shutoff. Existing configurations without this field use the five-minute default. Agent LEDs keep updating; App activity and binding changes do not reset the hardware-input timer. Shutoff is applied on the first polling cycle after the threshold, not an exact hardware timer. Reconnection preserves inactivity, while restarting the bridge starts a fresh interval. Controls mapped to `none` can still wake the lights without triggering an App action. This saves LED power, not Bluetooth power, and does not enable firmware deep sleep.
 
 The default ACT09 action creates an empty App session, potentially including a worktree. It does not start an agent or send a prompt. You can disable it with `config.keys.ACT09 = "none"` through `configure`. See the [full key map, LED meanings and tool reference](.github/extensions/ai-micro-copilot/README.md).
 

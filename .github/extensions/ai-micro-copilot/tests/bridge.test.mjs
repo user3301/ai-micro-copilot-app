@@ -192,7 +192,7 @@ class FakeDevice extends EventEmitter {
     async request(method, params) { this.requests.push({ method, params }); return true; }
     async close() { this.closed = true; }
 }
-function harness() {
+function harness(options = {}) {
     const device = new FakeDevice(), calls = [], saved = [], logs = [];
     const controller = new Controller({
         config: { slots: ["a", null, "b", "c", "d", null], pollMs: 30000 },
@@ -201,9 +201,41 @@ function harness() {
         navigate: async id => { calls.push({ name: "open-session-url", args: { id } }); },
         open: async () => device, save: async config => { saved.push(config); },
         log: (message, level) => logs.push({ message, level }),
+        ...options,
     });
     return { controller, device, calls, saved, logs };
 }
+
+test("Five minutes without hardware input turns off only background lights while Agent LEDs keep updating", async () => {
+    let now = 0, current = sessions;
+    const { controller, device, saved } = harness({
+        now: () => now, readSessions: async () => current,
+    });
+    const background = () => device.requests.filter(r => r.method === "v.oai.rgbcfg");
+    await controller.start();
+    try {
+        now = 299999;
+        await controller.tick();
+        assert.equal(background().at(-1).params.ambient.b, 0.1);
+        assert.equal(background().at(-1).params.keys.b, 0.1);
+        now = 300000;
+        await controller.tick();
+        assert.deepEqual(background().at(-1).params, {
+            ambient: { c: 0, b: 0, e: "off" }, keys: { c: 0, b: 0, e: "off" },
+        });
+        assert.equal(controller.status().backgroundIdle, true);
+        assert.equal(device.requests.at(-1).params[0].c, 0x0088ff);
+        assert.equal(device.requests.at(-1).params[0].b, 0.25);
+        const count = background().length;
+        current = [{ ...sessions[0], activity: { status: "idle" } }];
+        now = 302000;
+        await controller.tick();
+        assert.equal(device.requests.at(-1).params[0].c, 0x00cc66);
+        assert.equal(device.requests.at(-1).params[0].b, 0.25);
+        assert.equal(background().length, count);
+        assert.equal(saved.length, 0);
+    } finally { await controller.stop(); }
+});
 
 test("Agent key navigates directly rather than returning an Open confirmation card", async () => {
     const { controller } = harness();
@@ -216,6 +248,42 @@ test("Agent key navigates directly rather than returning an Open confirmation ca
         assert.deepEqual(opened, ["a"]);
         assert.deepEqual(cards, []);
     } finally { await controller.stop(); }
+});
+
+test("Hardware controls wake the background, execute once, and restart the idle interval", async () => {
+    const controls = [
+        [{ method: "v.oai.hid", params: { k: "AG00", ag: 0, act: 1 } }, "a"],
+        [{ method: "v.oai.hid", params: { k: "ACT07", act: 1 } }, "b"],
+        [{ method: "v.oai.hid", params: { k: "ENC_CW", act: 2 } }, "b"],
+        [{ method: "v.oai.hid", params: { k: "ENC", act: 1 } }, "a"],
+        [{ method: "v.oai.rad", params: { a: 0.75, d: 1 } }, "b"],
+    ];
+    for (const [message, target] of controls) {
+        let now = 0;
+        const { controller, device, calls } = harness({ now: () => now });
+        await controller.start();
+        try {
+            device.emit("input", { method: "v.oai.hid", params: { k: "AG00", ag: 0, act: 1 } });
+            await controller.queue;
+            now = 300000;
+            await controller.tick();
+            const count = calls.length;
+            now = 300001;
+            device.emit("input", message);
+            await controller.queue;
+            assert.equal(controller.status().backgroundIdle, false);
+            const background = device.requests.filter(r => r.method === "v.oai.rgbcfg").at(-1);
+            assert.equal(background.params.ambient.b, 0.1);
+            assert.equal(background.params.keys.b, 0.1);
+            assert.deepEqual(calls.slice(count), [{ name: "open-session-url", args: { id: target } }]);
+            now = 600000;
+            await controller.tick();
+            assert.equal(controller.status().backgroundIdle, false);
+            now = 600001;
+            await controller.tick();
+            assert.equal(controller.status().backgroundIdle, true);
+        } finally { await controller.stop(); }
+    }
 });
 
 test("Controller routes six-key events, waiting navigation, brightness and idle workspace creation", async () => {
@@ -237,6 +305,41 @@ test("Controller routes six-key events, waiting navigation, brightness and idle 
     } finally { await controller.stop(); }
     assert.equal(device.closed, true);
     assert(device.requests.at(-2).params.every(l => l.e === "off"));
+});
+
+test("Disabled controls still wake the background without App actions; releases and unknown inputs do not", async () => {
+    let now = 0, reads = 0;
+    const { controller, device, calls } = harness({
+        now: () => now, readSessions: async () => { reads++; return sessions; },
+    });
+    await controller.configure({ keys: { ACT06: "none", JOY_RIGHT: "none" } });
+    await controller.start();
+    try {
+        now = 299999;
+        for (const params of [{ k: "AG00", ag: 0, act: 0 }, { k: "TOUCH", act: 1 },
+            { k: "ACT06", act: 2 }]) {
+            device.emit("input", { method: "v.oai.hid", params });
+        }
+        device.emit("input", { method: "v.oai.rad", params: { a: 0, d: 0 } });
+        await controller.queue;
+        now = 300000;
+        await controller.tick();
+        assert.equal(controller.status().backgroundIdle, true);
+        for (const message of [
+            { method: "v.oai.hid", params: { k: "ACT06", act: 1 } },
+            { method: "v.oai.rad", params: { a: 0, d: 1 } },
+        ]) {
+            const before = reads;
+            device.emit("input", message);
+            await controller.queue;
+            assert.equal(controller.status().backgroundIdle, false);
+            assert.equal(reads, before);
+            assert.equal(calls.length, 0);
+            now += 300000;
+            await controller.tick();
+            assert.equal(controller.status().backgroundIdle, true);
+        }
+    } finally { await controller.stop(); }
 });
 
 test("Stale app state paints unknown and blocks actions without losing bindings", async () => {
@@ -312,6 +415,43 @@ test("Configuration is validated and persisted before applying; USB changes requ
     } finally { await controller.stop(); }
 });
 
+test("Idle timeout can be configured live or disabled without changing brightness or resetting on bindings", async () => {
+    let now = 0;
+    const { controller, device, saved } = harness({ now: () => now });
+    await controller.start();
+    try {
+        assert.equal(controller.status().backgroundIdleMs, 300000);
+        await controller.configure({ backgroundIdleMs: 1000 });
+        assert.equal(saved.at(-1).backgroundIdleMs, 1000);
+        now = 999;
+        await controller.tick();
+        assert.equal(controller.status().backgroundIdle, false);
+        now = 1000;
+        await controller.tick();
+        assert.equal(controller.status().backgroundIdle, true);
+        await controller.configure({ brightness: 0.5 });
+        await controller.bind(1, null);
+        assert.equal(controller.status().backgroundIdle, true);
+        assert.equal(saved.at(-1).brightness, 0.5);
+        assert.equal(saved.at(-1).backgroundIdleMs, 1000);
+        const background = () => device.requests.filter(r => r.method === "v.oai.rgbcfg").at(-1).params;
+        assert.equal(background().ambient.b, 0);
+        await controller.configure({ backgroundIdleMs: 0 });
+        assert.equal(background().ambient.b, 0.2);
+        assert.equal(background().keys.b, 0.2);
+        assert.equal(controller.status().backgroundIdle, false);
+        now = 86400000;
+        await controller.tick();
+        assert.equal(controller.status().backgroundIdle, false);
+        const count = saved.length;
+        for (const backgroundIdleMs of [-1, 0.5, 86400001, null, "1000"]) {
+            await assert.rejects(controller.configure({ backgroundIdleMs }), /backgroundIdleMs/);
+        }
+        assert.equal(saved.length, count);
+        assert.equal(saved.at(-1).backgroundIdleMs, 0);
+    } finally { await controller.stop(); }
+});
+
 test("Binding one key applies immediately and preserves all other keys and connection settings", async () => {
     const { controller, device, calls, saved } = harness();
     controller.readSessions = async () => [...sessions, { id: "new", activity: { status: "idle" } }];
@@ -378,6 +518,101 @@ test("Bluetooth reconnect pins the original device and applies bindings saved wh
         assert.equal(replacement.requests.at(-1).params[1].c, 0x0088ff);
         assert.equal(controller.status().connected, true);
         assert.equal(controller.status().serialNumber, "BLE-SERIAL");
+    } finally { await controller.stop(); }
+});
+
+test("Reconnect restores idle lighting without a flash and ignores input from the old connection", async () => {
+    let now = 0;
+    const replacement = new FakeDevice();
+    const device = new FakeDevice();
+    let attempts = 0;
+    const { controller, calls } = harness({
+        now: () => now, open: async () => attempts++ === 0 ? device : replacement,
+    });
+    await controller.start();
+    try {
+        now = 300000;
+        await controller.tick();
+        device.emit("fault", new Error("Bluetooth disconnected"));
+        now = 400000;
+        await controller.tick();
+        assert.equal(controller.status().connected, true);
+        assert.equal(controller.status().backgroundIdle, true);
+        const background = replacement.requests.filter(r => r.method === "v.oai.rgbcfg");
+        assert.equal(background.length, 1);
+        assert.equal(background[0].params.ambient.e, "off");
+        assert.equal(background[0].params.keys.b, 0);
+        assert.equal(replacement.requests.at(-1).params[0].b, 0.25);
+        const key = { method: "v.oai.hid", params: { k: "AG00", ag: 0, act: 1 } };
+        device.emit("input", key);
+        await controller.queue;
+        await controller.tick();
+        assert.equal(controller.status().backgroundIdle, true);
+        assert.equal(calls.length, 0);
+        replacement.emit("input", key);
+        await controller.queue;
+        assert.equal(controller.status().backgroundIdle, false);
+        assert.deepEqual(calls, [{ name: "open-session-url", args: { id: "a" } }]);
+    } finally { await controller.stop(); }
+});
+
+test("Wake failures are explicit and reconnect retries lighting without replaying the action", async () => {
+    let now = 0, rejectWrites = false;
+    const device = new FakeDevice();
+    const request = device.request.bind(device);
+    device.request = async (...args) => {
+        if (rejectWrites) throw new Error("Wake light write failed");
+        return request(...args);
+    };
+    const replacement = new FakeDevice();
+    let attempts = 0;
+    const { controller, calls, logs } = harness({
+        now: () => now, open: async () => attempts++ === 0 ? device : replacement,
+    });
+    await controller.start();
+    try {
+        now = 300000;
+        await controller.tick();
+        rejectWrites = true;
+        device.emit("input", { method: "v.oai.hid", params: { k: "AG00", ag: 0, act: 1 } });
+        await controller.queue;
+        assert.equal(controller.status().connected, false);
+        assert(logs.some(({ message }) => message.includes("Wake light write failed")));
+        assert.equal(calls.length, 0);
+        await controller.tick();
+        assert.equal(controller.status().connected, true);
+        assert.equal(controller.status().backgroundIdle, false);
+        assert.equal(replacement.requests[0].params.ambient.b, 0.1);
+        assert.equal(calls.length, 0);
+    } finally { await controller.stop(); }
+});
+
+test("Wake respects zero brightness and works even when App status is unavailable", async () => {
+    let now = 0, unavailable = false;
+    const { controller, device, calls, logs } = harness({
+        now: () => now, readSessions: async () => {
+            if (unavailable) throw new Error("App unavailable");
+            return sessions;
+        },
+    });
+    await controller.configure({ brightness: 0 });
+    await controller.start();
+    try {
+        now = 300000;
+        await controller.tick();
+        unavailable = true;
+        device.emit("input", { method: "v.oai.hid", params: { k: "AG00", ag: 0, act: 1 } });
+        await controller.queue;
+        assert.equal(controller.status().backgroundIdle, false);
+        const background = device.requests.filter(r => r.method === "v.oai.rgbcfg").at(-1).params;
+        assert.equal(background.ambient.b, 0);
+        assert.equal(background.keys.b, 0);
+        assert.equal(calls.length, 0);
+        assert(logs.some(({ message }) => message.includes("App unavailable")));
+        now = 600000;
+        await controller.tick();
+        assert.equal(controller.status().backgroundIdle, true);
+        assert.equal(controller.status().stale, true);
     } finally { await controller.stop(); }
 });
 
