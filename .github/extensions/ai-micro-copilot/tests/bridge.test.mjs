@@ -2,6 +2,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { writeFile, unlink, open as openFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { Decoder, encodeReports, validateConfig, DEFAULT_CONFIG, eventAction,
     lightsFor, sessionState, nextSlot, parseSnapshot, callApp, readSessions } from "../core.mjs";
 import { MicroHid, isUsbMicro, supportedFirmware, deviceTransport, selectDevice } from "../hid.mjs";
@@ -830,4 +834,123 @@ test("Direct navigation opens the exact App-provided URL, never constructs or su
     assert.deepEqual(opened, [url]);
     assert.deepEqual(calls, [{ name: "list_sessions_and_chats", arguments: {} }]);
     await assert.rejects(navigateSession(session, id, async () => { throw new Error("No URI handler"); }), /No URI handler/);
+});
+
+test("Agent navigation reads the full saved App catalogue instead of parsing an oversized-output notice", async () => {
+    const id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const url = `ghapp://sessions/${id}`;
+    const path = join(tmpdir(), `${Date.now()}-copilot-tool-output-${randomUUID().replaceAll("-", "")}.txt`);
+    const items = Array.from({ length: 56 }, (_, index) => ({
+        id: `other-${index}`, name: "Large catalogue ".repeat(40),
+    }));
+    items.push({ id, app_url: url });
+    const notice = `Output too large to read at once (20.0 KB). Saved to: ${path}\nConsider using tools like rg.\n\nPreview (first 500 chars):\nFound 57 item(s):\n[`;
+    await writeFile(path, `Found 57 item(s):\n${JSON.stringify(items)}`);
+    try {
+        const opened = [];
+        for (const result of [notice, { resultType: "success", textResultForLlm: notice }]) {
+            const session = { rpc: { tools: { execute: async () => result } } };
+            await navigateSession(session, id, async value => opened.push(value));
+        }
+        assert.deepEqual(opened, [url, url]);
+        await writeFile(path, JSON.stringify({ sessions }));
+        const session = { rpc: { tools: { execute: async () => ({
+            resultType: "success", textResultForLlm: notice,
+        }) } } };
+        assert.deepEqual(await readSessions(session), sessions);
+    } finally { await unlink(path); }
+});
+
+test("Saved App output preserves structured-result priority and rejects invalid, missing or excessive files", async () => {
+    const path = join(tmpdir(), `${Date.now()}-copilot-tool-output-${randomUUID().replaceAll("-", "")}.txt`);
+    const notice = path => `Output too large to read at once (20.0 KB). Saved to: ${path}\nPreview:\n[]`;
+    const session = result => ({ rpc: { tools: { execute: async () => result } } });
+    assert.deepEqual(await callApp(session({
+        resultType: "success", structuredContent: sessions, textResultForLlm: notice(path),
+    }), "list_sessions_and_chats"), sessions);
+    await assert.rejects(callApp(session({
+        resultType: "failure", textResultForLlm: notice(path),
+    }), "list_sessions_and_chats"), /list_sessions_and_chats:/);
+    await assert.rejects(callApp(session(notice(path)), "list_sessions_and_chats"), /cannot read saved App output/);
+    for (const invalid of ["relative.txt", join(tmpdir(), "private-config.json"),
+        join(tmpdir(), "copilot-tool-output-invalid.txt")]) {
+        await assert.rejects(callApp(session(notice(invalid)), "list_sessions_and_chats"), /invalid saved App output path/);
+    }
+    await assert.rejects(callApp(session("Output too large to read at once"), "get_sessions_status"),
+        /unsupported oversized App output notice/);
+    const file = await openFile(path, "w");
+    try { await file.truncate(16 * 1024 * 1024 + 1); }
+    finally { await file.close(); }
+    try {
+        await assert.rejects(callApp(session(notice(path)), "get_sessions_status"), /no larger than 16 MiB/);
+        const id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        await writeFile(path, `Found 1 item(s):\n${JSON.stringify([{ id, app_url: "https://example.com" }])}`);
+        let opened = false;
+        await assert.rejects(navigateSession(session(notice(path)), id, async () => { opened = true; }),
+            /invalid session URL/);
+        assert.equal(opened, false);
+    } finally { await unlink(path); }
+});
+
+test("Saved App output bounds actual reads when the file grows after stat", async t => {
+    const limit = 16 * 1024 * 1024;
+    const path = join(tmpdir(), `${Date.now()}-copilot-tool-output-${randomUUID().replaceAll("-", "")}.txt`);
+    const writer = await openFile(path, "w+");
+    try {
+        await writer.writeFile("small");
+        const identity = await writer.stat();
+        const prototype = Object.getPrototypeOf(writer);
+        const originalStat = prototype.stat, originalRead = prototype.read;
+        let reader, bytesRead = 0;
+        t.mock.method(prototype, "stat", async function (...args) {
+            const stat = await originalStat.apply(this, args);
+            if (stat.dev === identity.dev && stat.ino === identity.ino) {
+                reader = this;
+                await writer.truncate(limit + 65536);
+            }
+            return stat;
+        });
+        t.mock.method(prototype, "read", async function (...args) {
+            const result = await originalRead.apply(this, args);
+            if (this === reader) bytesRead += result.bytesRead;
+            return result;
+        });
+        const session = { rpc: { tools: { execute: async () =>
+            `Output too large to read at once (20.0 KB). Saved to: ${path}\n` } } };
+        await assert.rejects(callApp(session, "get_sessions_status"), /no larger than 16 MiB/);
+        assert.equal(bytesRead, limit + 1);
+        assert.equal(reader.fd, -1);
+    } finally {
+        t.mock.restoreAll();
+        await writer.close();
+        await unlink(path);
+    }
+});
+
+test("Saved App output accepts exactly 16 MiB and decodes UTF-8 across short reads", async t => {
+    const limit = 16 * 1024 * 1024;
+    const path = join(tmpdir(), `${Date.now()}-copilot-tool-output-${randomUUID().replaceAll("-", "")}.txt`);
+    const writer = await openFile(path, "w+");
+    try {
+        const text = "a".repeat(65534) + "\u{1f990}" + "b".repeat(limit - 65538);
+        await writer.writeFile(text);
+        const prototype = Object.getPrototypeOf(writer);
+        const originalRead = prototype.read;
+        let bytesRead = 0;
+        t.mock.method(prototype, "read", async function (buffer, offset, length, position) {
+            const result = await originalRead.call(this, buffer, offset, Math.min(length, 65535), position);
+            bytesRead += result.bytesRead;
+            return result;
+        });
+        const session = { rpc: { tools: { execute: async () =>
+            `Output too large to read at once (16.0 MB). Saved to: ${path}\n` } } };
+        assert.equal(await callApp(session, "get_sessions_status"), text);
+        assert.equal(bytesRead, limit);
+        await writer.truncate(0);
+        assert.equal(await callApp(session, "get_sessions_status"), "");
+    } finally {
+        t.mock.restoreAll();
+        await writer.close();
+        await unlink(path);
+    }
 });
