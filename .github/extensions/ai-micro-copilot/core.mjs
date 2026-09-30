@@ -206,10 +206,23 @@ export async function callApp(session, name, args = {}) {
             throw new Error("saved output must be an App output file in the local temporary directory");
         const file = await open(resolved, "r");
         try {
+            const limit = 16 * 1024 * 1024;
             const stat = await file.stat();
-            if (!stat.isFile() || stat.size > 16 * 1024 * 1024)
+            if (!stat.isFile() || stat.size > limit)
                 throw new Error("saved output must be a regular file no larger than 16 MiB");
-            return await file.readFile({ encoding: "utf8" });
+            const chunks = [];
+            let size = 0;
+            while (true) {
+                // Read one extra byte to detect growth since stat without an unbounded read.
+                const buffer = Buffer.allocUnsafe(Math.min(65536, limit + 1 - size));
+                const { bytesRead } = await file.read(buffer, 0, buffer.length, null);
+                if (bytesRead === 0) break;
+                size += bytesRead;
+                if (size > limit)
+                    throw new Error("saved output must be a regular file no larger than 16 MiB");
+                chunks.push(buffer.subarray(0, bytesRead));
+            }
+            return Buffer.concat(chunks, size).toString("utf8");
         } finally { await file.close(); }
     } catch (error) {
         throw new Error(`${name}: cannot read saved App output: ${error.message}`, { cause: error });
