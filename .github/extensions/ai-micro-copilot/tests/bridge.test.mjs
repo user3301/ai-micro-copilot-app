@@ -2,6 +2,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { writeFile, unlink, open as openFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { randomUUID } from "node:crypto";
 import { Decoder, encodeReports, validateConfig, DEFAULT_CONFIG, eventAction,
     lightsFor, sessionState, nextSlot, parseSnapshot, callApp, readSessions } from "../core.mjs";
 import { MicroHid, isUsbMicro, supportedFirmware, deviceTransport, selectDevice } from "../hid.mjs";
@@ -830,4 +834,60 @@ test("Direct navigation opens the exact App-provided URL, never constructs or su
     assert.deepEqual(opened, [url]);
     assert.deepEqual(calls, [{ name: "list_sessions_and_chats", arguments: {} }]);
     await assert.rejects(navigateSession(session, id, async () => { throw new Error("No URI handler"); }), /No URI handler/);
+});
+
+test("Agent navigation reads the full saved App catalogue instead of parsing an oversized-output notice", async () => {
+    const id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const url = `ghapp://sessions/${id}`;
+    const path = join(tmpdir(), `${Date.now()}-copilot-tool-output-${randomUUID().replaceAll("-", "")}.txt`);
+    const items = Array.from({ length: 56 }, (_, index) => ({
+        id: `other-${index}`, name: "Large catalogue ".repeat(40),
+    }));
+    items.push({ id, app_url: url });
+    const notice = `Output too large to read at once (20.0 KB). Saved to: ${path}\nConsider using tools like rg.\n\nPreview (first 500 chars):\nFound 57 item(s):\n[`;
+    await writeFile(path, `Found 57 item(s):\n${JSON.stringify(items)}`);
+    try {
+        const opened = [];
+        for (const result of [notice, { resultType: "success", textResultForLlm: notice }]) {
+            const session = { rpc: { tools: { execute: async () => result } } };
+            await navigateSession(session, id, async value => opened.push(value));
+        }
+        assert.deepEqual(opened, [url, url]);
+        await writeFile(path, JSON.stringify({ sessions }));
+        const session = { rpc: { tools: { execute: async () => ({
+            resultType: "success", textResultForLlm: notice,
+        }) } } };
+        assert.deepEqual(await readSessions(session), sessions);
+    } finally { await unlink(path); }
+});
+
+test("Saved App output preserves structured-result priority and rejects invalid, missing or excessive files", async () => {
+    const path = join(tmpdir(), `${Date.now()}-copilot-tool-output-${randomUUID().replaceAll("-", "")}.txt`);
+    const notice = path => `Output too large to read at once (20.0 KB). Saved to: ${path}\nPreview:\n[]`;
+    const session = result => ({ rpc: { tools: { execute: async () => result } } });
+    assert.deepEqual(await callApp(session({
+        resultType: "success", structuredContent: sessions, textResultForLlm: notice(path),
+    }), "list_sessions_and_chats"), sessions);
+    await assert.rejects(callApp(session({
+        resultType: "failure", textResultForLlm: notice(path),
+    }), "list_sessions_and_chats"), /list_sessions_and_chats:/);
+    await assert.rejects(callApp(session(notice(path)), "list_sessions_and_chats"), /cannot read saved App output/);
+    for (const invalid of ["relative.txt", join(tmpdir(), "private-config.json"),
+        join(tmpdir(), "copilot-tool-output-invalid.txt")]) {
+        await assert.rejects(callApp(session(notice(invalid)), "list_sessions_and_chats"), /invalid saved App output path/);
+    }
+    await assert.rejects(callApp(session("Output too large to read at once"), "get_sessions_status"),
+        /unsupported oversized App output notice/);
+    const file = await openFile(path, "w");
+    try { await file.truncate(16 * 1024 * 1024 + 1); }
+    finally { await file.close(); }
+    try {
+        await assert.rejects(callApp(session(notice(path)), "get_sessions_status"), /no larger than 16 MiB/);
+        const id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        await writeFile(path, `Found 1 item(s):\n${JSON.stringify([{ id, app_url: "https://example.com" }])}`);
+        let opened = false;
+        await assert.rejects(navigateSession(session(notice(path)), id, async () => { opened = true; }),
+            /invalid session URL/);
+        assert.equal(opened, false);
+    } finally { await unlink(path); }
 });

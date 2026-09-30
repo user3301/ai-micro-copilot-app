@@ -1,4 +1,8 @@
 // SPDX-License-Identifier: MIT
+import { open, realpath } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { basename, dirname, isAbsolute } from "node:path";
+
 export const ACTIONS = ["previous", "next", "attention", "new-session", "status",
     "focus", "brightness", "none"];
 
@@ -186,10 +190,30 @@ export function parseSnapshot(value) {
 
 export async function callApp(session, name, args = {}) {
     const result = await session.rpc.tools.execute({ name, arguments: args });
-    if (typeof result === "string") return result;
-    if (!result || result.resultType !== "success")
+    if (typeof result !== "string" && (!result || result.resultType !== "success"))
         throw new Error(`${name}: ${result?.error || result?.textResultForLlm || "tool failed"}`);
-    return result.structuredContent ?? result.textResultForLlm;
+    const value = typeof result === "string" ? result : result.structuredContent ?? result.textResultForLlm;
+    if (typeof value !== "string" || !value.startsWith("Output too large to read at once")) return value;
+    const match = /^Output too large to read at once \([^\r\n]+\)\. Saved to: ([^\r\n]+)(?:\r?\n|$)/.exec(value);
+    if (!match) throw new Error(`${name}: unsupported oversized App output notice`);
+    const path = match[1];
+    if (!isAbsolute(path) || !/^\d+-copilot-tool-output-[a-f0-9]{32}\.txt$/i.test(basename(path)))
+        throw new Error(`${name}: invalid saved App output path`);
+    try {
+        const [resolved, temp] = await Promise.all([realpath(path), realpath(tmpdir())]);
+        const normalize = value => process.platform === "win32" ? value.toLowerCase() : value;
+        if (normalize(dirname(resolved)) !== normalize(temp) || basename(resolved) !== basename(path))
+            throw new Error("saved output must be an App output file in the local temporary directory");
+        const file = await open(resolved, "r");
+        try {
+            const stat = await file.stat();
+            if (!stat.isFile() || stat.size > 16 * 1024 * 1024)
+                throw new Error("saved output must be a regular file no larger than 16 MiB");
+            return await file.readFile({ encoding: "utf8" });
+        } finally { await file.close(); }
+    } catch (error) {
+        throw new Error(`${name}: cannot read saved App output: ${error.message}`, { cause: error });
+    }
 }
 
 export async function readSessions(session) {
