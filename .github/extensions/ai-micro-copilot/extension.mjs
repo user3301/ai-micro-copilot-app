@@ -8,7 +8,8 @@ import { fileURLToPath } from "node:url";
 import { callApp, readSessions, validateConfig, DEFAULT_CONFIG, ACTIONS } from "./core.mjs";
 import { Controller } from "./controller.mjs";
 import { listDevices, MicroHid } from "./hid.mjs";
-import { navigateSession } from "./navigation.mjs";
+import { createNavigator } from "./navigation.mjs";
+import { createUriOpener } from "./windows-uri.mjs";
 
 const configPath = fileURLToPath(new URL("./config.json", import.meta.url));
 let config;
@@ -18,6 +19,8 @@ catch (error) {
     config = structuredClone(DEFAULT_CONFIG);
 }
 let controller;
+let navigator;
+const uriOpener = createUriOpener(error => controller.report(error));
 let lock;
 async function releaseLock() {
     if (!lock) return;
@@ -66,20 +69,24 @@ const session = await joinSession({
                     if (operation === "sessions") result = await readSessions(session);
                     else if (operation === "devices") result = (await listDevices())
                         .map(d => ({ transport: d.transport, serialNumber: d.serialNumber, product: d.product, path: d.path }));
-                    else if (operation === "bind") result = await controller.bind(slot, sessionId);
+                    else if (operation === "bind") {
+                        try { result = await controller.bind(slot, sessionId); }
+                        finally { navigator.clear(); }
+                    }
                     else if (operation === "configure") {
                         if (!update) throw new Error("configure requires config");
-                        result = await controller.configure(update);
+                        try { result = await controller.configure(update); }
+                        finally { navigator.clear(); }
                     } else if (operation === "start") {
                         if (!controller.running) {
                             await acquireLock();
-                            try { await controller.start(); }
-                            catch (error) { await releaseLock(); throw error; }
+                            try { await uriOpener.start(); await controller.start(); }
+                            catch (error) { uriOpener.close(); await releaseLock(); throw error; }
                         }
                         result = controller.status();
                     } else if (operation === "stop") {
                         try { await controller.stop(); }
-                        finally { await releaseLock(); }
+                        finally { uriOpener.close(); navigator.clear(); await releaseLock(); }
                         result = controller.status();
                     } else if (operation === "status") result = controller.status();
                     else throw new Error("Unknown operation");
@@ -91,10 +98,20 @@ const session = await joinSession({
         },
     ],
 });
+navigator = createNavigator(session, url => uriOpener.open(url));
 controller = new Controller({
-    config, readSessions: () => readSessions(session),
+    config, readSessions: async () => {
+        try {
+            const sessions = await readSessions(session);
+            await navigator.refresh();
+            return sessions;
+        } catch (error) {
+            navigator.clear();
+            throw error;
+        }
+    },
     call: (name, args) => callApp(session, name, args),
-    navigate: id => navigateSession(session, id),
+    navigate: id => navigator.navigate(id),
     open: options => MicroHid.open(options),
     save: async value => {
         await writeFile(`${configPath}.tmp`, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
@@ -112,6 +129,8 @@ async function shutdown() {
     try { await controller.stop(); }
     catch (error) { console.error(`[AI Micro] Shutdown: ${error.message}`); }
     finally {
+        uriOpener.close();
+        navigator.clear();
         try { await releaseLock(); }
         catch (error) { console.error(`[AI Micro] Lock cleanup: ${error.message}`); }
     }

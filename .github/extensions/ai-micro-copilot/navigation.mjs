@@ -36,3 +36,34 @@ export async function navigateSession(session, id, open = openSessionUrl) {
     const items = await callApp(session, "list_sessions_and_chats");
     await open(sessionUrl(items, id));
 }
+
+export function createNavigator(session, open = openSessionUrl, now = () => performance.now()) {
+    let items = null, expires = 0;
+    const clear = () => { items = null; expires = 0; };
+    const refresh = async () => {
+        if (items !== null && now() < expires) return;
+        clear();
+        const result = await callApp(session, "list_sessions_and_chats");
+        const parsed = typeof result === "string"
+            ? JSON.parse(result.replace(/^Found \d+ item\(s\):\s*/, "")) : result;
+        if (!Array.isArray(parsed)) throw new Error("Unsupported App session catalogue format");
+        items = parsed;
+        expires = now() + 30000;
+    };
+    return {
+        clear, refresh,
+        async navigate(id) {
+            try {
+                await refresh();
+                if (!items.some(item => item?.id === id)) {
+                    clear();
+                    await refresh();
+                }
+                await open(sessionUrl(items, id));
+            } catch (error) {
+                clear();
+                throw error;
+            }
+        },
+    };
+}

@@ -10,7 +10,7 @@ import { Decoder, encodeReports, validateConfig, DEFAULT_CONFIG, eventAction,
     lightsFor, sessionState, nextSlot, parseSnapshot, callApp, readSessions } from "../core.mjs";
 import { MicroHid, isUsbMicro, supportedFirmware, deviceTransport, selectDevice } from "../hid.mjs";
 import { Controller } from "../controller.mjs";
-import { sessionUrl, navigateSession } from "../navigation.mjs";
+import { sessionUrl, navigateSession, createNavigator } from "../navigation.mjs";
 
 test("Report 6 framing round trips UTF-8, escapes, adjacent objects and maximum length", () => {
     const decoder = new Decoder();
@@ -254,6 +254,56 @@ test("Agent key navigates directly rather than returning an Open confirmation ca
     } finally { await controller.stop(); }
 });
 
+test("Agent input uses a recent snapshot but refreshes at expiry and after polling failure", async () => {
+    let now = 0, reads = 0, fail = false;
+    const { controller, device, calls } = harness({
+        now: () => now,
+        readSessions: async () => { reads++; if (fail) throw new Error("App unavailable"); return sessions; },
+    });
+    await controller.start();
+    try {
+        device.emit("input", { method: "v.oai.hid", params: { k: "AG00", ag: 0, act: 1 } });
+        await controller.queue;
+        assert.equal(calls.length, 1);
+        assert.equal(reads, 1);
+        now = 2500;
+        await controller.perform({ action: "slot", slot: 0 });
+        assert.equal(reads, 2);
+        fail = true;
+        await controller.tick();
+        await assert.rejects(controller.perform({ action: "slot", slot: 0 }), /App unavailable/);
+        assert.equal(calls.length, 2);
+    } finally { await controller.stop(); }
+});
+
+test("Hardware Agent keys reach the correct verified URLs without App reads on the warm path", async () => {
+    const a = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", b = "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const items = [a, b].map(id => ({ id, app_url: `ghapp://sessions/${id}` }));
+    const opened = [];
+    let reads = 0, lists = 0;
+    const session = { rpc: { tools: { execute: async () => {
+        lists++;
+        return { resultType: "success", structuredContent: items };
+    } } } };
+    const navigator = createNavigator(session, async url => opened.push(url), () => 0);
+    const { controller, device } = harness({
+        config: { slots: [a, b, null, null, null, null], pollMs: 30000 },
+        now: () => 0,
+        readSessions: async () => { reads++; await navigator.refresh(); return items; },
+        navigate: id => navigator.navigate(id),
+    });
+    await controller.start();
+    try {
+        for (const ag of [0, 1, 0]) {
+            device.emit("input", { method: "v.oai.hid", params: { k: `AG0${ag}`, ag, act: 1 } });
+            await controller.queue;
+        }
+        assert.deepEqual(opened, [items[0].app_url, items[1].app_url, items[0].app_url]);
+        assert.equal(reads, 1);
+        assert.equal(lists, 1);
+    } finally { await controller.stop(); }
+});
+
 test("Hardware controls wake the background, execute once, and restart the idle interval", async () => {
     const controls = [
         [{ method: "v.oai.hid", params: { k: "AG00", ag: 0, act: 1 } }, "a"],
@@ -398,6 +448,7 @@ test("Failed navigation never changes selected slot; missing bindings never fall
         await assert.rejects(controller.perform({ action: "slot", slot: 0 }), /denied/);
         assert.equal(controller.selected, null);
         controller.readSessions = async () => [];
+        await controller.tick();
         await assert.rejects(controller.perform({ action: "slot", slot: 0 }), /unavailable/);
     } finally { await controller.stop(); }
 });
@@ -605,6 +656,7 @@ test("Wake respects zero brightness and works even when App status is unavailabl
         now = 300000;
         await controller.tick();
         unavailable = true;
+        now += 2500;
         device.emit("input", { method: "v.oai.hid", params: { k: "AG00", ag: 0, act: 1 } });
         await controller.queue;
         assert.equal(controller.status().backgroundIdle, false);
@@ -613,7 +665,7 @@ test("Wake respects zero brightness and works even when App status is unavailabl
         assert.equal(background.keys.b, 0);
         assert.equal(calls.length, 0);
         assert(logs.some(({ message }) => message.includes("App unavailable")));
-        now = 600000;
+        now = 602500;
         await controller.tick();
         assert.equal(controller.status().backgroundIdle, true);
         assert.equal(controller.status().stale, true);
@@ -655,13 +707,15 @@ test("An event queued on an old connection is never replayed on its replacement"
 });
 
 test("Disconnect while refreshing App state prevents navigation", async () => {
-    const { controller, device, calls } = harness();
+    let now = 0;
+    const { controller, device, calls } = harness({ now: () => now });
     await controller.start();
     try {
         controller.readSessions = async () => {
             device.emit("fault", new Error("Bluetooth disconnected"));
             return sessions;
         };
+        now = 2500;
         await assert.rejects(controller.perform({ action: "slot", slot: 0 }), /during status refresh/);
         assert.equal(calls.length, 0);
     } finally { await controller.stop(); }
@@ -834,6 +888,62 @@ test("Direct navigation opens the exact App-provided URL, never constructs or su
     assert.deepEqual(opened, [url]);
     assert.deepEqual(calls, [{ name: "list_sessions_and_chats", arguments: {} }]);
     await assert.rejects(navigateSession(session, id, async () => { throw new Error("No URI handler"); }), /No URI handler/);
+});
+
+test("Navigation reuses verified App URLs until expiry and invalidates after errors or binding changes", async () => {
+    const id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    const url = `ghapp://sessions/${id}`;
+    let now = 0, queries = 0, fail = false, items = [{ id, app_url: url }];
+    const opened = [];
+    const session = { rpc: { tools: { execute: async () => {
+        queries++;
+        if (fail) throw new Error("Catalogue unavailable");
+        return { resultType: "success", structuredContent: items };
+    } } } };
+    const navigator = createNavigator(session, async url => opened.push(url), () => now);
+    await navigator.refresh();
+    await navigator.navigate(id);
+    await navigator.navigate(id);
+    assert.equal(queries, 1);
+    assert.deepEqual(opened, [url, url]);
+    now = 30000;
+    fail = true;
+    await assert.rejects(navigator.navigate(id), /Catalogue unavailable/);
+    assert.equal(opened.length, 2);
+    fail = false;
+    items = [{ id, app_url: "https://example.com" }];
+    await assert.rejects(navigator.navigate(id), /invalid session URL/);
+    items = [{ id, app_url: url }];
+    await navigator.navigate(id);
+    navigator.clear();
+    await navigator.navigate(id);
+    assert.equal(queries, 5);
+    assert.equal(opened.length, 4);
+});
+
+test("Navigation refreshes cache misses and clears cached URLs after a launcher failure", async () => {
+    const a = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", b = "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let items = [{ id: a, app_url: `ghapp://sessions/${a}` }], reads = 0, failed = true;
+    const session = { rpc: { tools: { execute: async () => {
+        reads++; return { resultType: "success", structuredContent: items };
+    } } } };
+    const opened = [];
+    const navigator = createNavigator(session, async url => {
+        if (failed) throw new Error("No URI handler");
+        opened.push(url);
+    });
+    await navigator.refresh();
+    items = [{ id: b, app_url: `ghapp://sessions/${b}` }];
+    await assert.rejects(navigator.navigate(b), /No URI handler/);
+    assert.equal(reads, 2);
+    failed = false;
+    await navigator.navigate(b);
+    assert.equal(reads, 3);
+    assert.deepEqual(opened, [items[0].app_url]);
+    items = [{ id: b, app_url: `ghapp://sessions/${a}` }];
+    navigator.clear();
+    await assert.rejects(navigator.navigate(b), /invalid session URL/);
+    assert.equal(opened.length, 1);
 });
 
 test("Agent navigation reads the full saved App catalogue instead of parsing an oversized-output notice", async () => {
