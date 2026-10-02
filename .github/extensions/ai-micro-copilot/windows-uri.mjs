@@ -11,7 +11,7 @@ $info.UseShellExecute = $true
 [Console]::Out.WriteLine('READY')
 while ($null -ne ($url = [Console]::In.ReadLine())) {
     try {
-        if ($url -cnotmatch '^ghapp://sessions/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        if ($url -notmatch '^ghapp://sessions/[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
             throw 'Invalid Copilot session URL'
         }
         $info.FileName = $url
