@@ -11,6 +11,7 @@ export class Controller {
         this.stale = true; this.device = null; this.fault = null;
         this.identity = null;
         this.now = now; this.lastInputAt = now();
+        this.refreshedAt = -Infinity;
         this.backgroundIdle = false; this.backgroundBrightness = null;
         this.queue = Promise.resolve(); this.queued = 0; this.lastError = "";
     }
@@ -30,6 +31,7 @@ export class Controller {
     async refresh() {
         try {
             this.sessions = await this.readSessions();
+            this.refreshedAt = this.now();
             this.stale = false;
         } catch (error) {
             this.stale = true;
@@ -204,7 +206,9 @@ export class Controller {
         try { await this.paintBackground(); }
         catch (error) { this.fault = error; throw error; }
         if (action === "none") return;
-        await this.refresh();
+        const cachedNavigation = ["slot", "next", "previous", "focus"].includes(action);
+        if (!cachedNavigation || this.stale || this.now() - this.refreshedAt >= 2500)
+            await this.refresh();
         if (!this.running) return;
         if (this.device !== device || this.fault)
             throw new Error("Device disconnected during status refresh; action was not executed");
