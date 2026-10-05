@@ -42,8 +42,10 @@ export class BridgeClient {
         this.peer = peer; this.catalogue = null; this.expires = 0;
         return peer;
     }
-    async publish(peer, forceCatalogue = false) {
-        await peer.request("attach");
+    async publish(peer, forceCatalogue = false, pendingIds = []) {
+        const status = await peer.request("attach");
+        const needed = new Set([...status.slots.map(slot => slot.sessionId), ...pendingIds]
+            .filter(id => typeof id === "string"));
         try {
             const sessions = await readSessions(this.session);
             if (forceCatalogue || this.catalogue === null || performance.now() >= this.expires) {
@@ -55,13 +57,15 @@ export class BridgeClient {
                 this.expires = performance.now() + 30000;
             }
             // Do not send prompts, conversation bodies, or full pending-input objects to the daemon.
-            const compact = sessions.map(s => ({
+            const compact = sessions.filter(s => needed.has(s.id)).map(s => ({
                 id: s.id, name: s.name, project_id: s.project_id, is_running: s.is_running,
                 awaiting_user_input: Boolean(s.awaiting_user_input),
                 awaiting_plan_approval: Boolean(s.awaiting_plan_approval),
                 activity: { status: s.activity?.status },
             }));
-            await peer.request("snapshot", { sessions: compact, catalogue: this.catalogue });
+            await peer.request("snapshot", {
+                sessions: compact, catalogue: this.catalogue.filter(item => needed.has(item.id)),
+            });
         } catch (error) {
             this.catalogue = null;
             if (!peer.closed) {
@@ -74,7 +78,12 @@ export class BridgeClient {
     request(operation, params) {
         return this.serialize(async () => {
             const peer = await this.connect();
-            if (["start", "bind", "configure"].includes(operation)) await this.publish(peer, true);
+            if (["start", "bind", "configure"].includes(operation)) {
+                // Include proposed targets before the daemon validates and saves new bindings.
+                const pendingIds = operation === "bind" ? [params?.sessionId]
+                    : operation === "configure" && Array.isArray(params?.slots) ? params.slots : [];
+                await this.publish(peer, true, pendingIds);
+            }
             const result = await peer.request(operation, params);
             if (result?.pollMs) this.pollMs = result.pollMs;
             return result;
