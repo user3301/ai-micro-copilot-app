@@ -7,7 +7,8 @@
   "type": "module",
   "engines": { "node": ">=22" },
   "scripts": {
-    "check": "node --check extension.mjs && node --check controller.mjs && node --check core.mjs && node --check hid.mjs && node --check navigation.mjs && node --check windows-uri.mjs",
+    "check": "node --check extension.mjs && node --check controller.mjs && node --check core.mjs && node --check hid.mjs && node --check navigation.mjs && node --check windows-uri.mjs && node --check bridge-rpc.mjs && node --check bridge-service.mjs && node --check bridge-client.mjs && node --check daemon.mjs",
+    "daemon": "node daemon.mjs",
     "test": "node --test tests/*.test.mjs"
   },
   "dependencies": { "node-hid": "^3.1.0" }

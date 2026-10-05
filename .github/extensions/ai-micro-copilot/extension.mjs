@@ -1,43 +1,12 @@
 // SPDX-License-Identifier: MIT
 import { joinSession } from "@github/copilot-sdk/extension";
-import { readFile, writeFile, rename } from "node:fs/promises";
-import { createServer } from "node:net";
-import { createHash } from "node:crypto";
-import { homedir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { callApp, readSessions, validateConfig, DEFAULT_CONFIG, ACTIONS } from "./core.mjs";
-import { Controller } from "./controller.mjs";
-import { listDevices, MicroHid } from "./hid.mjs";
-import { createNavigator } from "./navigation.mjs";
-import { createUriOpener } from "./windows-uri.mjs";
+import { readSessions, ACTIONS } from "./core.mjs";
+import { listDevices } from "./hid.mjs";
+import { BridgeClient } from "./bridge-client.mjs";
 
 const configPath = fileURLToPath(new URL("./config.json", import.meta.url));
-let config;
-try { config = validateConfig(JSON.parse(await readFile(configPath, "utf8"))); }
-catch (error) {
-    if (error.code !== "ENOENT") throw error;
-    config = structuredClone(DEFAULT_CONFIG);
-}
-let controller;
-let navigator;
-const uriOpener = createUriOpener(error => controller.report(error));
-let lock;
-async function releaseLock() {
-    if (!lock) return;
-    const server = lock; lock = null;
-    await new Promise((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-}
-async function acquireLock() {
-    if (process.platform !== "win32") throw new Error("This release supports Windows HID only");
-    const owner = createHash("sha256").update(homedir()).digest("hex").slice(0, 16);
-    const server = createServer(socket => socket.destroy());
-    await new Promise((resolve, reject) => {
-        server.once("error", reject);
-        server.listen(`\\\\.\\pipe\\ai-micro-copilot-${owner}`, resolve);
-    });
-    server.on("error", error => controller.report(error));
-    lock = server;
-}
+let client;
 const properties = {
     operation: { type: "string", enum: ["sessions", "devices", "configure", "bind", "start", "stop", "status"] },
     slot: { type: "integer", minimum: 1, maximum: 6, description: "Agent key number for bind (1-based)." },
@@ -61,7 +30,7 @@ const session = await joinSession({
     tools: [
         {
             name: "ai_micro_control",
-            description: "Manage the Windows USB/Bluetooth AI Micro bridge without flashing firmware. List sessions/devices; bind one Agent key (slot 1-6, sessionId or null) without changing other keys, or configure all six slots. Binding saves config.json and applies live. Select transport and device explicitly; stop before changing connection settings. Start only after user selects bindings. Does not approve prompts or send agent messages.",
+            description: "Manage the independent Windows AI Micro USB/Bluetooth bridge. The daemon must be launched separately with node daemon.mjs. Session-host shutdown disconnects the status feed, not the keyboard: verified cached navigation remains available and LEDs become unknown. Bind one key (slot 1-6), configure, start, stop or inspect status. Preserve other bindings; stop before changing transport/device. Start only with user-selected bindings. No firmware flashing, permission approval or agent messages.",
             parameters: { type: "object", properties, required: ["operation"], additionalProperties: false },
             handler: async ({ operation, config: update, slot, sessionId }) => {
                 try {
@@ -70,25 +39,13 @@ const session = await joinSession({
                     else if (operation === "devices") result = (await listDevices())
                         .map(d => ({ transport: d.transport, serialNumber: d.serialNumber, product: d.product, path: d.path }));
                     else if (operation === "bind") {
-                        try { result = await controller.bind(slot, sessionId); }
-                        finally { navigator.clear(); }
+                        result = await client.request("bind", { slot, sessionId });
                     }
                     else if (operation === "configure") {
                         if (!update) throw new Error("configure requires config");
-                        try { result = await controller.configure(update); }
-                        finally { navigator.clear(); }
-                    } else if (operation === "start") {
-                        if (!controller.running) {
-                            await acquireLock();
-                            try { await uriOpener.start(); await controller.start(); }
-                            catch (error) { uriOpener.close(); await releaseLock(); throw error; }
-                        }
-                        result = controller.status();
-                    } else if (operation === "stop") {
-                        try { await controller.stop(); }
-                        finally { uriOpener.close(); navigator.clear(); await releaseLock(); }
-                        result = controller.status();
-                    } else if (operation === "status") result = controller.status();
+                        result = await client.request("configure", update);
+                    } else if (["start", "stop", "status"].includes(operation))
+                        result = await client.request(operation);
                     else throw new Error("Unknown operation");
                     return { resultType: "success", textResultForLlm: JSON.stringify(result) };
                 } catch (error) {
@@ -98,44 +55,16 @@ const session = await joinSession({
         },
     ],
 });
-navigator = createNavigator(session, url => uriOpener.open(url));
-controller = new Controller({
-    config, readSessions: async () => {
-        try {
-            const sessions = await readSessions(session);
-            await navigator.refresh();
-            return sessions;
-        } catch (error) {
-            navigator.clear();
-            throw error;
-        }
-    },
-    call: (name, args) => callApp(session, name, args),
-    navigate: id => navigator.navigate(id),
-    open: options => MicroHid.open(options),
-    save: async value => {
-        await writeFile(`${configPath}.tmp`, `${JSON.stringify(value, null, 2)}\n`, { mode: 0o600 });
-        await rename(`${configPath}.tmp`, configPath);
-    },
+client = new BridgeClient({
+    session, configPath,
+    runtimePath: fileURLToPath(new URL("./.bridge-runtime.json", import.meta.url)),
     log: (message, level) => {
         session.log(`[AI Micro] ${message}`, { level }).catch(error =>
             console.error(`[AI Micro] ${message}; timeline logging failed: ${error.message}`));
     },
 });
-let stopping = false;
-async function shutdown() {
-    if (stopping) return;
-    stopping = true;
-    try { await controller.stop(); }
-    catch (error) { console.error(`[AI Micro] Shutdown: ${error.message}`); }
-    finally {
-        uriOpener.close();
-        navigator.clear();
-        try { await releaseLock(); }
-        catch (error) { console.error(`[AI Micro] Lock cleanup: ${error.message}`); }
-    }
-}
-session.on("session.shutdown", () => { void shutdown(); });
+client.start();
+session.on("session.shutdown", () => client.close());
 for (const signal of ["SIGINT", "SIGTERM"]) {
-    process.once(signal, () => { shutdown().finally(() => process.exit(0)); });
+    process.once(signal, () => { client.close(); process.exit(0); });
 }

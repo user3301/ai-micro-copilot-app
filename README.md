@@ -13,6 +13,7 @@ This is an unofficial, community-maintained host extension, not firmware or an o
 - Bind each of the six Agent keys to a specific App project session, independent of sidebar ordering.
 - Show App-reported busy, waiting, idle, unknown and offline states on the keys.
 - Switch sessions directly using Agent keys, the rotary encoder and the joystick.
+- Keep cached session navigation working after the App recycles the hosting CLI. A separate HID daemon survives; unavailable App status is shown as unknown, not as the last live color.
 - Change bindings through an agent conversation: save configuration and apply it immediately, without restarting the bridge.
 - Connect over USB or Windows Bluetooth HID, and retry the same device after disconnection.
 - Turn off background and function-key lighting after five minutes without hardware input, while keeping Agent status LEDs active; the next operation wakes the background and still performs its action.
@@ -42,9 +43,10 @@ Other firmware versions are rejected until verified. This repository does not in
    npm ci --registry=https://registry.npmjs.org --no-audit --no-fund
    ```
 
-3. Ask the agent to reload extensions and confirm that `ai-micro-copilot` is ready. Do not install `@github/copilot-sdk` yourself or launch `extension.mjs` with `node`; the App provides the SDK and session connection.
-4. Ask the agent to list AI Micro devices and available sessions. Select USB or Bluetooth, the corresponding device serial number, and at least one session binding. The public configuration example has **no personal IDs** and defaults to USB.
-5. Ask the agent to start the AI Micro bridge and confirm its status is `running=true`, `connected=true`, `stale=false`, with no error.
+3. From an **independent Windows terminal**, enter the same extension directory and run `npm run daemon`. Leave it running. This starts the hardware service but does not connect the keyboard until you request `start`. Do not launch it as an ordinary child of the recyclable Copilot CLI; an agent-assisted launch must use an explicitly detached process and verify readiness.
+4. Ask the agent to reload extensions and confirm that `ai-micro-copilot` is ready. Do not install `@github/copilot-sdk` yourself or launch `extension.mjs` with `node`; the App provides the SDK and session connection.
+5. Ask the agent to list AI Micro devices and available sessions. Select USB or Bluetooth, the corresponding device serial number, and at least one session binding. The public configuration example has **no personal IDs** and defaults to USB.
+6. Ask the agent to start the AI Micro bridge and confirm its status is `running=true`, `connected=true`, `appConnected=true`, `stale=false`, with no error.
 
 Example conversation:
 
@@ -70,9 +72,19 @@ Only one local session needs to host the bridge; the six target sessions do not 
 
 The extension creates `.github\extensions\ai-micro-copilot\config.json` when you configure it. This ignored file contains your session bindings, device selection, brightness and key mappings. `config.example.json` documents the defaults; copying it is optional.
 
-Use the `ai_micro_control` tool through the agent to change bindings. Its `bind` operation saves the file atomically and updates the running bridge. **There is no file watcher**: manual JSON edits require stopping, reloading and starting the extension.
+Use the `ai_micro_control` tool through the agent to change bindings. Its `bind` operation saves the file atomically and updates the running bridge. **There is no file watcher**: manual JSON edits require stopping the bridge and restarting the daemon.
 
-After restarting the computer or App, open the hosting session, let the extension load, and ask the agent to **start the bridge again**. Bindings persist, but the running state does not. An already-running bridge retries when the keyboard comes back online. Keep the hosting session running.
+When the App recycles the hosting CLI, only its status feed disconnects. The independent daemon keeps the HID connection, device reconnect loop and verified navigation links. Bound keys become purple/unknown on feed loss (or after the freshness deadline if the feed stalls). Agent keys, previous/next and focus keep working from the last verified catalogue. Waiting-session selection, creation and configuration require fresh App data and fail explicitly while offline. Cached targets can have been deleted; the daemon never substitutes another session or invents a URL.
+
+When the hosting extension loads again, it reconnects and resumes status updates automatically, without reopening HID or requiring `start`. Pressing a key requests navigation, not a model turn, so navigating to a session does not guarantee the App reloads its extension immediately. Status remains unknown until a fresh feed is available.
+
+`stop` explicitly closes HID, turns off LEDs and stops navigation; feed reconnection does **not** undo it. The daemon remains available for management. With no App connection, run `node daemon.mjs --stop` from the same directory to stop the hardware. Ctrl+C in the independent daemon terminal exits the service. After a computer restart or daemon exit, launch it again and explicitly start the bridge; no Windows autostart is installed. An App restart alone need not terminate the daemon.
+
+The ignored `.bridge-runtime.json` contains a per-launch local IPC credential, never a GitHub token. Do not share it. One authenticated Windows named-pipe service owns the keyboard per Windows user; it accepts one status producer at a time. This is a local same-user trust boundary, not a sandbox against programs already running as you.
+
+Daemon shutdown rejects requests and disconnects clients before draining in-flight controls and closing HID. It retains the singleton pipe until hardware cleanup and discovery-file removal finish, then releases it for a replacement daemon. Requests arriving during shutdown cannot restart the bridge.
+
+Status snapshots include only currently bound sessions and any proposed binding targets, not the entire App catalogue. This keeps large unrelated session lists out of the 1 MiB RPC frames while allowing new bindings to be validated. The frame-size limit remains enforced.
 
 `backgroundIdleMs` controls background-light inactivity: it defaults to `300000` (five minutes), accepts integer milliseconds up to `86400000`, and can be set to `0` to disable automatic background shutoff. Existing configurations without this field use the five-minute default. Agent LEDs keep updating; App activity and binding changes do not reset the hardware-input timer. Shutoff is applied on the first polling cycle after the threshold, not an exact hardware timer. Reconnection preserves inactivity, while restarting the bridge starts a fresh interval. Controls mapped to `none` can still wake the lights without triggering an App action. This saves LED power, not Bluetooth power, and does not enable firmware deep sleep.
 
@@ -92,6 +104,10 @@ ai-micro-copilot-app\
     extensions\
       ai-micro-copilot\
         extension.mjs
+        daemon.mjs
+        bridge-client.mjs
+        bridge-service.mjs
+        bridge-rpc.mjs
         controller.mjs
         core.mjs
         hid.mjs
@@ -119,9 +135,11 @@ npm test
 
 Tests use mock HID and App adapters; they do not connect to a physical keyboard or require a running App. GitHub Actions runs syntax checks and tests on Windows with Node.js 22. Hardware acceptance is separate.
 
-The entrypoint registers the tool and owns configuration persistence and the single-instance lock. `controller.mjs` coordinates session state and actions; `core.mjs` handles configuration, framing and state mapping; `hid.mjs` manages USB/Bluetooth HID; `navigation.mjs` validates App-supplied session links before opening them.
+Lifecycle regressions run real separate Node processes and Windows named pipes, terminate the App-feed producer, and check continued navigation, unknown LEDs, feed restoration and explicit stop. USB hardware testing on 2026-10-02 also confirmed navigation after terminating the actual session extension and automatic status recovery after reloading it, without restarting the daemon or issuing another `start`.
 
-After changing a loaded extension, reload it and explicitly start the bridge again. Preserve the firmware identity checks, explicit device selection and prohibition on automatic approvals or prompt sending.
+The entrypoint registers tools and feeds compact App state through `bridge-client.mjs`. `daemon.mjs` / `bridge-service.mjs` own configuration, the singleton pipe and HID lifetime; `bridge-rpc.mjs` provides authenticated, bounded request/reply transport. `controller.mjs` coordinates device state and actions; `core.mjs` handles configuration, framing and state mapping; `hid.mjs` manages USB/Bluetooth HID; `navigation.mjs` validates App-supplied links.
+
+After changing daemon/controller code, explicitly stop hardware, restart the independent daemon, reload the extension and start hardware again. Reloading only the session extension does not update an already-running daemon. Preserve firmware identity checks, explicit device selection and the prohibition on automatic approvals or prompt sending.
 
 ## Compatibility and limitations
 
@@ -130,10 +148,10 @@ Stock-firmware hardware testing has confirmed Bluetooth session navigation, LEDs
 - No Windows/App autostart, automatic USB/Bluetooth switching, or support claimed for macOS/Linux.
 - Sleep/wake, Bluetooth-adapter toggling, long-running stability, all ACT keys and six simultaneously active sessions still need hardware validation.
 - App tool and SDK compatibility is experimental and may change.
-- Abrupt host exit may leave the last LED colors on the keyboard. LEDs are not a guaranteed live heartbeat.
+- Loss of the App feed changes LEDs to unknown while the daemon is alive. A crash/forced termination of the daemon itself or computer sleep can still leave the last LED colors on the keyboard; LEDs are not a firmware-level heartbeat.
 - Error colors depend on what the App exposes; ordinary tool failures are not automatically classified as failed sessions.
 
-When reporting an issue, include Windows, Node, App and firmware versions, transport, reproduction steps and a **redacted** error. Do not upload `config.json`, session IDs, device serial numbers, private session titles or full session logs.
+When reporting an issue, include Windows, Node, App and firmware versions, transport, reproduction steps and a **redacted** error. Do not upload `config.json`, `.bridge-runtime.json`, session IDs, device serial numbers, private session titles or full session logs.
 
 ## License and acknowledgements
 
