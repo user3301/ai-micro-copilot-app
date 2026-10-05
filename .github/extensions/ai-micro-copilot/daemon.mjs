@@ -51,8 +51,7 @@ if (process.argv[2] === "--stop") {
     const shutdown = async () => {
         if (stopping) return;
         stopping = true;
-        try { await service.close(); }
-        finally { await unlink(runtimePath); }
+        await service.close(() => unlink(runtimePath));
     };
     for (const signal of ["SIGINT", "SIGTERM"]) {
         process.once(signal, () => {

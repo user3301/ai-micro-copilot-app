@@ -82,7 +82,7 @@ When the hosting extension loads again, it reconnects and resumes status updates
 
 The ignored `.bridge-runtime.json` contains a per-launch local IPC credential, never a GitHub token. Do not share it. One authenticated Windows named-pipe service owns the keyboard per Windows user; it accepts one status producer at a time. This is a local same-user trust boundary, not a sandbox against programs already running as you.
 
-Daemon shutdown stops accepting requests and disconnects clients before draining in-flight controls and closing HID. Requests arriving during shutdown cannot restart the bridge.
+Daemon shutdown rejects requests and disconnects clients before draining in-flight controls and closing HID. It retains the singleton pipe until hardware cleanup and discovery-file removal finish, then releases it for a replacement daemon. Requests arriving during shutdown cannot restart the bridge.
 
 Status snapshots include only currently bound sessions and any proposed binding targets, not the entire App catalogue. This keeps large unrelated session lists out of the 1 MiB RPC frames while allowing new bindings to be validated. The frame-size limit remains enforced.
 

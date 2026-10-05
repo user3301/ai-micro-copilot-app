@@ -137,19 +137,23 @@ export class BridgeService {
         }
         throw new Error(`Unsupported bridge operation: ${method}`);
     }
-    close() {
+    close(beforeUnlock = async () => {}) {
         if (this.shutdown) return this.shutdown;
         this.stopping = true;
-        // Seal admission before capturing the final control chain, including buffered requests.
-        const serverClosed = this.server?.listening
-            ? new Promise(resolve => this.server.close(resolve)) : Promise.resolve();
+        // Reject traffic but retain the singleton pipe until hardware and discovery cleanup finish.
         for (const peer of this.peers) peer.close();
         this.shutdown = (async () => {
             await this.controls;
             try { await this.controller.stop(); }
             finally {
                 try { this.release(); }
-                finally { await serverClosed; }
+                finally {
+                    try { await beforeUnlock(); }
+                    finally {
+                        if (this.server?.listening)
+                            await new Promise(resolve => this.server.close(resolve));
+                    }
+                }
             }
         })();
         return this.shutdown;

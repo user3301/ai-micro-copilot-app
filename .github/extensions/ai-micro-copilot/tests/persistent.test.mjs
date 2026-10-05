@@ -4,6 +4,10 @@ import assert from "node:assert/strict";
 import { fork } from "node:child_process";
 import { EventEmitter, once } from "node:events";
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:net";
+import { mkdtemp, readFile, writeFile, unlink, rmdir } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { connectBridge } from "../bridge-rpc.mjs";
 import { BridgeService } from "../bridge-service.mjs";
 
@@ -13,6 +17,73 @@ const snapshot = {
     sessions: [{ id, name: "Bound session", activity: { status: "idle" } }],
     catalogue: [{ id, app_url: url }],
 };
+
+test("Shutdown retains the singleton until HID and discovery cleanup finish", {
+    skip: process.platform !== "win32", timeout: 20000,
+}, async () => {
+    const endpoint = `\\\\.\\pipe\\ai-micro-test-${randomUUID()}`, token = randomUUID();
+    const directory = await mkdtemp(join(tmpdir(), "ai-micro-shutdown-"));
+    const runtimePath = join(directory, ".bridge-runtime.json");
+    let enteringClose, finishClose, enteringCleanup, finishCleanup;
+    const closing = new Promise(resolve => { enteringClose = resolve; });
+    const closeGate = new Promise(resolve => { finishClose = resolve; });
+    const cleaning = new Promise(resolve => { enteringCleanup = resolve; });
+    const cleanupGate = new Promise(resolve => { finishCleanup = resolve; });
+    const device = new EventEmitter();
+    device.request = async () => {};
+    device.close = async () => { enteringClose(); await closeGate; };
+    const service = new BridgeService({
+        config: { slots: [id, null, null, null, null, null] }, token,
+        open: async () => device, navigate: async () => {}, save: async () => {}, log: () => {},
+    });
+    const contenders = [];
+    const claim = async () => {
+        const server = createServer(socket => socket.destroy());
+        contenders.push(server);
+        await new Promise((resolve, reject) => {
+            server.once("error", reject);
+            server.listen(endpoint, resolve);
+        });
+    };
+    let peer, shutdown;
+    try {
+        await service.listen(endpoint);
+        await writeFile(runtimePath, "old runtime");
+        peer = await connectBridge({ endpoint, token });
+        await peer.request("attach");
+        await peer.request("snapshot", snapshot);
+        await peer.request("start");
+        shutdown = service.close(async () => {
+            enteringCleanup();
+            await cleanupGate;
+            await unlink(runtimePath);
+        });
+        await closing;
+        await assert.rejects(claim(), { code: "EADDRINUSE" });
+        await assert.rejects(connectBridge({ endpoint, token }));
+        assert.equal(await readFile(runtimePath, "utf8"), "old runtime");
+        finishClose();
+        await cleaning;
+        await assert.rejects(claim(), { code: "EADDRINUSE" });
+        finishCleanup();
+        await shutdown;
+        await assert.rejects(readFile(runtimePath), { code: "ENOENT" });
+        await claim();
+        await writeFile(runtimePath, "replacement runtime");
+        await service.close();
+        assert.equal(await readFile(runtimePath, "utf8"), "replacement runtime");
+    } finally {
+        finishClose(); finishCleanup();
+        peer?.close();
+        await shutdown;
+        await service.close();
+        for (const server of contenders) {
+            if (server.listening) await new Promise(resolve => server.close(resolve));
+        }
+        await unlink(runtimePath).catch(error => { if (error.code !== "ENOENT") throw error; });
+        await rmdir(directory);
+    }
+});
 
 test("Service shutdown rejects new starts while HID close is pending", {
     skip: process.platform !== "win32", timeout: 20000,
