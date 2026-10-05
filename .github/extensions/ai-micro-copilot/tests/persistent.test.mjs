@@ -2,9 +2,10 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { fork } from "node:child_process";
-import { once } from "node:events";
+import { EventEmitter, once } from "node:events";
 import { randomUUID } from "node:crypto";
 import { connectBridge } from "../bridge-rpc.mjs";
+import { BridgeService } from "../bridge-service.mjs";
 
 const id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 const url = `ghapp://sessions/${id}`;
@@ -12,6 +13,98 @@ const snapshot = {
     sessions: [{ id, name: "Bound session", activity: { status: "idle" } }],
     catalogue: [{ id, app_url: url }],
 };
+
+test("Service shutdown rejects new starts while HID close is pending", {
+    skip: process.platform !== "win32", timeout: 20000,
+}, async () => {
+    const endpoint = `\\\\.\\pipe\\ai-micro-test-${randomUUID()}`, token = randomUUID();
+    let closingDevice, finishDeviceClose, opens = 0, prepares = 0;
+    const deviceClosing = new Promise(resolve => { closingDevice = resolve; });
+    const deviceCloseGate = new Promise(resolve => { finishDeviceClose = resolve; });
+    const device = new EventEmitter();
+    device.request = async () => {};
+    device.close = async () => { closingDevice(); await deviceCloseGate; };
+    const service = new BridgeService({
+        config: { slots: [id, null, null, null, null, null] }, token,
+        open: async () => { opens++; return device; },
+        prepare: async () => { prepares++; },
+        navigate: async () => {}, save: async () => {}, log: () => {},
+    });
+    let peer, shutdown;
+    try {
+        await service.listen(endpoint);
+        peer = await connectBridge({ endpoint, token });
+        await peer.request("attach");
+        await peer.request("snapshot", snapshot);
+        await peer.request("start");
+        shutdown = service.close();
+        await deviceClosing;
+        const lateStart = peer.request("start").then(
+            () => "accepted", error => error.message);
+        // The status request is a wire-order barrier for the preceding start.
+        await peer.request("status").catch(() => {});
+        finishDeviceClose();
+        await shutdown;
+        assert.match(await lateStart, /closed|shutting down|EPIPE|ECONNRESET/i);
+        assert.equal(prepares, 1, "Shutdown must not launch another URI helper");
+        assert.equal(opens, 1, "Shutdown must not reopen HID");
+        assert.equal(service.status().running, false);
+        assert.equal(service.status().connected, false);
+        await assert.rejects(connectBridge({ endpoint, token }));
+    } finally {
+        finishDeviceClose();
+        peer?.close();
+        await shutdown;
+        await service.close();
+    }
+});
+
+test("Service shutdown drains an in-flight start and concurrent closes share final cleanup", {
+    skip: process.platform !== "win32", timeout: 20000,
+}, async () => {
+    const endpoint = `\\\\.\\pipe\\ai-micro-test-${randomUUID()}`, token = randomUUID();
+    let enteringOpen, finishOpen, deviceCloses = 0, releases = 0;
+    const opening = new Promise(resolve => { enteringOpen = resolve; });
+    const openGate = new Promise(resolve => { finishOpen = resolve; });
+    const device = new EventEmitter();
+    device.request = async () => {};
+    device.close = async () => { deviceCloses++; };
+    const service = new BridgeService({
+        config: { slots: [id, null, null, null, null, null] }, token,
+        open: async () => { enteringOpen(); await openGate; return device; },
+        release: () => { releases++; },
+        navigate: async () => {}, save: async () => {}, log: () => {},
+    });
+    let peer, shutdown, start;
+    try {
+        await service.listen(endpoint);
+        peer = await connectBridge({ endpoint, token });
+        await peer.request("attach");
+        await peer.request("snapshot", snapshot);
+        start = peer.request("start").then(() => "accepted", error => error.message);
+        await opening;
+        shutdown = service.close();
+        assert.equal(service.close(), shutdown);
+        let complete = false;
+        shutdown.then(() => { complete = true; });
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(complete, false, "Cleanup must wait for an already running start");
+        assert.equal(releases, 0);
+        finishOpen();
+        await shutdown;
+        await start;
+        assert.equal(deviceCloses, 1);
+        assert.equal(releases, 1);
+        assert.equal(service.status().running, false);
+        assert.equal(service.status().connected, false);
+    } finally {
+        finishOpen();
+        peer?.close();
+        await start;
+        await shutdown;
+        await service.close();
+    }
+});
 
 test("Separate HID process survives feed loss, navigates offline, restores state and honors explicit stop", {
     skip: process.platform !== "win32", timeout: 20000,

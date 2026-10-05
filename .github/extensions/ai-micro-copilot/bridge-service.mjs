@@ -15,6 +15,7 @@ export class BridgeService {
         this.prepare = prepare; this.release = release;
         this.peers = new Set();
         this.controls = Promise.resolve();
+        this.stopping = false; this.shutdown = null;
         this.controller = new Controller({
             config, open, save, log, now,
             readSessions: async () => {
@@ -46,8 +47,10 @@ export class BridgeService {
     }
     async listen(endpoint) {
         this.server = createServer(socket => {
+            if (this.stopping) { socket.destroy(); return; }
             let authenticated = false;
             const peer = new BridgePeer(socket, async (method, params) => {
+                if (this.stopping) throw new Error("Bridge service is shutting down");
                 if (!authenticated) {
                     const supplied = Buffer.from(typeof params?.token === "string" ? params.token : "");
                     const expected = Buffer.from(this.token);
@@ -70,8 +73,9 @@ export class BridgeService {
                 if (this.feed === peer) {
                     this.feed = null; this.receivedAt = -Infinity;
                     this.controller.stale = true;
-                    this.controller.enqueue(() => this.reconcile())
-                        .catch(error => this.controller.report(error));
+                    if (!this.stopping)
+                        this.controller.enqueue(() => this.reconcile())
+                            .catch(error => this.controller.report(error));
                 }
             });
         });
@@ -83,6 +87,7 @@ export class BridgeService {
         this.server.on("error", error => this.controller.report(error));
     }
     async handle(peer, method, params) {
+        if (this.stopping) throw new Error("Bridge service is shutting down");
         if (method === "attach") {
             if (this.feed && this.feed !== peer && !this.feed.closed)
                 throw new Error("Another extension is providing App status");
@@ -132,13 +137,21 @@ export class BridgeService {
         }
         throw new Error(`Unsupported bridge operation: ${method}`);
     }
-    async close() {
-        await this.controls;
-        try { await this.controller.stop(); }
-        finally {
-            this.release();
-            for (const peer of this.peers) peer.close();
-            if (this.server?.listening) await new Promise(resolve => this.server.close(resolve));
-        }
+    close() {
+        if (this.shutdown) return this.shutdown;
+        this.stopping = true;
+        // Seal admission before capturing the final control chain, including buffered requests.
+        const serverClosed = this.server?.listening
+            ? new Promise(resolve => this.server.close(resolve)) : Promise.resolve();
+        for (const peer of this.peers) peer.close();
+        this.shutdown = (async () => {
+            await this.controls;
+            try { await this.controller.stop(); }
+            finally {
+                try { this.release(); }
+                finally { await serverClosed; }
+            }
+        })();
+        return this.shutdown;
     }
 }

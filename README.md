@@ -82,6 +82,8 @@ When the hosting extension loads again, it reconnects and resumes status updates
 
 The ignored `.bridge-runtime.json` contains a per-launch local IPC credential, never a GitHub token. Do not share it. One authenticated Windows named-pipe service owns the keyboard per Windows user; it accepts one status producer at a time. This is a local same-user trust boundary, not a sandbox against programs already running as you.
 
+Daemon shutdown stops accepting requests and disconnects clients before draining in-flight controls and closing HID. Requests arriving during shutdown cannot restart the bridge.
+
 Status snapshots include only currently bound sessions and any proposed binding targets, not the entire App catalogue. This keeps large unrelated session lists out of the 1 MiB RPC frames while allowing new bindings to be validated. The frame-size limit remains enforced.
 
 `backgroundIdleMs` controls background-light inactivity: it defaults to `300000` (five minutes), accepts integer milliseconds up to `86400000`, and can be set to `0` to disable automatic background shutoff. Existing configurations without this field use the five-minute default. Agent LEDs keep updating; App activity and binding changes do not reset the hardware-input timer. Shutoff is applied on the first polling cycle after the threshold, not an exact hardware timer. Reconnection preserves inactivity, while restarting the bridge starts a fresh interval. Controls mapped to `none` can still wake the lights without triggering an App action. This saves LED power, not Bluetooth power, and does not enable firmware deep sleep.
