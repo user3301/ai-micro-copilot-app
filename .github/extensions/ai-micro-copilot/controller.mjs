@@ -2,10 +2,12 @@
 import { eventAction, lightsFor, nextSlot, sessionState, validateConfig } from "./core.mjs";
 
 export class Controller {
-    constructor({ config, readSessions, call, navigate, open, save, log, now = () => performance.now() }) {
+    constructor({ config, readSessions, call, navigate, open, save, log, now = () => performance.now(),
+        offlineNavigation = () => false }) {
         this.config = validateConfig(config);
         this.readSessions = readSessions; this.call = call;
         this.navigate = navigate;
+        this.offlineNavigation = offlineNavigation;
         this.open = open; this.save = save; this.log = log;
         this.sessions = []; this.selected = null; this.running = false;
         this.stale = true; this.device = null; this.fault = null;
@@ -207,8 +209,15 @@ export class Controller {
         catch (error) { this.fault = error; throw error; }
         if (action === "none") return;
         const cachedNavigation = ["slot", "next", "previous", "focus"].includes(action);
-        if (!cachedNavigation || this.stale || this.now() - this.refreshedAt >= 2500)
-            await this.refresh();
+        if (!cachedNavigation || this.stale || this.now() - this.refreshedAt >= 2500 ||
+            this.offlineNavigation()) {
+            try { await this.refresh(); }
+            catch (error) {
+                if (!cachedNavigation || !this.offlineNavigation()) throw error;
+                this.report(error);
+                await this.paint();
+            }
+        }
         if (!this.running) return;
         if (this.device !== device || this.fault)
             throw new Error("Device disconnected during status refresh; action was not executed");
