@@ -62,6 +62,10 @@ Example conversation:
 
 You can use the same requests in Chinese, for example: **“把这个会话绑定到 Agent 1”** and **“启动 AI Micro 蓝牙桥接”**. The agent must resolve real session IDs and your device selection instead of guessing them.
 
+### Agent skill for USB startup
+
+The repository includes the [ai-micro-usb-bridge skill](.github/skills/ai-micro-usb-bridge/SKILL.md) for requests such as “开启usb桥接”. It documents the normal extension-tool flow and a local RPC recovery flow when the extension is ready but `ai_micro_control` is missing from the agent's tool catalogue. It preserves existing bindings, starts the daemon independently, and verifies that the extension resumes live status updates. If a session has not discovered the new skill yet, ask the agent to read that file explicitly.
+
 ### Installing in another project
 
 Copy this repository's `.github\extensions\ai-micro-copilot` folder into the same location in the project that will host the bridge, install dependencies there, and reload extensions in that project's session. Use the repository files only: do not copy another person's `config.json` or `node_modules`, and do not overwrite an existing local configuration.
@@ -99,6 +103,9 @@ ai-micro-copilot-app\
   THIRD_PARTY_NOTICES.md
   .gitignore
   .github\
+    skills\
+      ai-micro-usb-bridge\
+        SKILL.md
     workflows\
       test.yml
     extensions\
